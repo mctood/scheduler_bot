@@ -41,7 +41,7 @@ class AccessMiddleware(BaseMiddleware):
 async def run(settings: Settings) -> None:
     db = Database(settings.db_path)
     await db.connect()
-    scheduler = Scheduler(db)
+    scheduler = Scheduler(db, tz=settings.timezone)
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
@@ -59,6 +59,8 @@ async def run(settings: Settings) -> None:
             BotCommand(command="channels", description="Выбрать канал"),
             BotCommand(command="interval", description="Интервал между постами"),
             BotCommand(command="queue", description="Очередь публикаций"),
+            BotCommand(command="first", description="Время первого поста"),
+            BotCommand(command="night", description="Ночное время без публикаций"),
             BotCommand(command="add", description="Добавить канал вручную"),
             BotCommand(command="help", description="Помощь"),
         ]

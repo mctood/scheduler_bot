@@ -25,8 +25,8 @@ from aiogram.types import (
 
 from .config import Settings
 from .db import Database
-from .scheduling import format_interval, parse_interval
-from .service import Scheduler
+from .scheduling import format_interval, parse_datetime, parse_interval, parse_night
+from .service import Scheduler, channel_night
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ HELP = (
     "/interval — посмотреть или изменить интервал "
     "(очередь пересчитается начиная с первого поста)\n"
     "/queue — очередь публикаций: просмотр, удаление, выравнивание\n"
+    "/first — перенести первый пост очереди на другое время "
+    "(остальные пересчитаются от него)\n"
+    "/night — ночное время, когда посты не публикуются (например 20:00-08:00)\n"
     "/cancel — отменить текущее действие\n\n"
     "⚠️ Не удаляйте посты из чата со мной до публикации — я копирую их отсюда."
 )
@@ -65,7 +68,7 @@ class PostCb(CallbackData, prefix="post"):
 
 
 class QueueCb(CallbackData, prefix="q"):
-    action: str  # refresh | realign
+    action: str  # refresh | realign | first | night
     chat_id: int
 
 
@@ -74,6 +77,14 @@ class AddChannel(StatesGroup):
 
 
 class SetInterval(StatesGroup):
+    waiting = State()
+
+
+class SetFirst(StatesGroup):
+    waiting = State()
+
+
+class SetNight(StatesGroup):
     waiting = State()
 
 
@@ -174,6 +185,7 @@ def queue_view(channel, posts, settings: Settings) -> tuple[str, InlineKeyboardM
     lines = [
         f"📋 Очередь «{title}»",
         f"Интервал: {format_interval(channel['interval_minutes'])}",
+        f"Ночное время: {channel_night(channel) or 'выключено'}",
         "",
     ]
     rows: list[list[InlineKeyboardButton]] = []
@@ -195,6 +207,18 @@ def queue_view(channel, posts, settings: Settings) -> tuple[str, InlineKeyboardM
         )
     if len(posts) > QUEUE_PAGE_LIMIT:
         lines.append(f"…и ещё {len(posts) - QUEUE_PAGE_LIMIT}")
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🕐 Первый пост",
+                callback_data=QueueCb(action="first", chat_id=channel["chat_id"]).pack(),
+            ),
+            InlineKeyboardButton(
+                text="🌙 Ночь",
+                callback_data=QueueCb(action="night", chat_id=channel["chat_id"]).pack(),
+            ),
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -449,6 +473,170 @@ async def apply_interval(
     return True
 
 
+
+async def state_channel(message: Message, state: FSMContext, bot: Bot, db: Database):
+    data = await state.get_data()
+    channel = await db.get_channel(data.get("chat_id", 0))
+    if channel is None or not await is_user_admin(bot, channel["chat_id"], message.from_user.id):
+        await state.clear()
+        await message.answer("Канал недоступен. Выберите канал: /channels")
+        return None
+    return channel
+
+
+async def send_queue(message: Message, header: str, channel_id: int, db: Database, settings: Settings):
+    channel = await db.get_channel(channel_id)
+    text, kb = queue_view(channel, await db.pending_posts(channel_id), settings)
+    await message.answer(header + "\n\n" + text, reply_markup=kb)
+
+
+# ---------- first post time ----------
+
+
+async def ask_first(message: Message, channel, state: FSMContext, db: Database, settings: Settings):
+    posts = await db.pending_posts(channel["chat_id"])
+    if not posts:
+        await message.answer("Очередь пуста — нечего переносить.")
+        return
+    await state.set_state(SetFirst.waiting)
+    await state.update_data(chat_id=channel["chat_id"])
+    await message.answer(
+        f"Первый пост сейчас: <b>{fmt_ts(posts[0]['publish_at'], settings, with_year=True)}</b>\n\n"
+        "Пришлите новое время: <code>14:30</code> (ближайшие 14:30) или "
+        "<code>21.11 14:30</code>.\n"
+        "Остальные посты пересчитаются от него с текущим интервалом.\n\n/cancel — отмена"
+    )
+
+
+async def apply_first(
+    message: Message, channel, raw: str, scheduler: Scheduler, settings: Settings
+) -> bool:
+    ts = parse_datetime(raw, scheduler.now(), settings.timezone)
+    if ts is None:
+        await message.answer("Не понял время. Примеры: <code>14:30</code>, <code>21.11 14:30</code>")
+        return False
+    if ts <= scheduler.now():
+        await message.answer("Это время уже прошло. Укажите время в будущем.")
+        return False
+    posts = await scheduler.set_first_time(channel["chat_id"], ts)
+    if not posts:
+        await message.answer("Очередь пуста — нечего переносить.")
+        return True
+    header = f"✅ Первый пост перенесён на <b>{fmt_ts(ts, settings, with_year=True)}</b>"
+    night = channel_night(channel)
+    if night:
+        local = datetime.fromtimestamp(ts, settings.timezone)
+        if night.contains(local.hour * 60 + local.minute):
+            header += f"\n⚠️ Это время попадает в ночное окно ({night}), но первый пост встанет туда, куда вы указали."
+    await send_queue(message, header, channel["chat_id"], scheduler.db, settings)
+    return True
+
+
+@router.message(Command("first"))
+async def cmd_first(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    scheduler: Scheduler,
+    settings: Settings,
+):
+    await state.clear()
+    channel = await require_channel(message, bot, db)
+    if channel is None:
+        return
+    if command.args:
+        await apply_first(message, channel, command.args, scheduler, settings)
+    else:
+        await ask_first(message, channel, state, db, settings)
+
+
+@router.message(StateFilter(SetFirst.waiting), F.text)
+async def on_first_value(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    scheduler: Scheduler,
+    settings: Settings,
+):
+    channel = await state_channel(message, state, bot, db)
+    if channel and await apply_first(message, channel, message.text, scheduler, settings):
+        await state.clear()
+
+
+# ---------- night time ----------
+
+
+async def ask_night(message: Message, channel, state: FSMContext):
+    await state.set_state(SetNight.waiting)
+    await state.update_data(chat_id=channel["chat_id"])
+    await message.answer(
+        f"Ночное время сейчас: <b>{channel_night(channel) or 'выключено'}</b>\n\n"
+        "Пришлите промежуток, когда посты не публикуются: <code>20:00-08:00</code> или "
+        "<code>23-7</code>. Чтобы выключить — <code>off</code>.\n"
+        "Пост, попавший на ночь, переносится на конец ночи. Очередь пересчитается.\n\n"
+        "/cancel — отмена"
+    )
+
+
+async def apply_night(
+    message: Message, channel, raw: str, scheduler: Scheduler, settings: Settings
+) -> bool:
+    raw = raw.strip().lower()
+    if raw in ("off", "выкл", "нет", "0", "-"):
+        night = None
+    else:
+        night = parse_night(raw)
+        if night is None:
+            await message.answer(
+                "Не понял промежуток. Примеры: <code>20:00-08:00</code>, <code>23-7</code>, "
+                "<code>off</code>"
+            )
+            return False
+    posts = await scheduler.set_night(channel["chat_id"], night)
+    header = f"✅ Ночное время: <b>{night}</b>" if night else "✅ Ночное время выключено"
+    if posts:
+        header += f"\nОчередь пересчитана ({len(posts)} шт.)."
+    await send_queue(message, header, channel["chat_id"], scheduler.db, settings)
+    return True
+
+
+@router.message(Command("night"))
+async def cmd_night(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    scheduler: Scheduler,
+    settings: Settings,
+):
+    await state.clear()
+    channel = await require_channel(message, bot, db)
+    if channel is None:
+        return
+    if command.args:
+        await apply_night(message, channel, command.args, scheduler, settings)
+    else:
+        await ask_night(message, channel, state)
+
+
+@router.message(StateFilter(SetNight.waiting), F.text)
+async def on_night_value(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: Database,
+    scheduler: Scheduler,
+    settings: Settings,
+):
+    channel = await state_channel(message, state, bot, db)
+    if channel and await apply_night(message, channel, message.text, scheduler, settings):
+        await state.clear()
+
+
 @router.message(Command("queue"))
 async def cmd_queue(message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext):
     await state.clear()
@@ -467,11 +655,20 @@ async def cb_queue(
     db: Database,
     scheduler: Scheduler,
     settings: Settings,
+    state: FSMContext,
 ):
     chat_id = callback_data.chat_id
     channel = await db.get_channel(chat_id)
     if channel is None or not await is_user_admin(bot, chat_id, query.from_user.id):
         await query.answer("Нет доступа к каналу", show_alert=True)
+        return
+    if callback_data.action == "first":
+        await query.answer()
+        await ask_first(query.message, channel, state, db, settings)
+        return
+    if callback_data.action == "night":
+        await query.answer()
+        await ask_night(query.message, channel, state)
         return
     if callback_data.action == "realign":
         posts = await scheduler.realign(chat_id)

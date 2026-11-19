@@ -105,3 +105,90 @@ def test_queue_flow(tmp_path):
         await db.close()
 
     asyncio.run(scenario())
+
+
+# ---------- ночное время и первый пост ----------
+
+from datetime import datetime  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+from bot.scheduling import Night, parse_datetime, parse_night, skip_night  # noqa: E402
+
+MSK = ZoneInfo("Europe/Moscow")
+NIGHT = Night(20 * 60, 8 * 60)
+
+
+def at(day: int, hour: int, minute: int = 0) -> int:
+    return int(datetime(2026, 11, day, hour, minute, tzinfo=MSK).timestamp())
+
+
+def test_parse_night():
+    assert parse_night("20:00-08:00") == NIGHT
+    assert parse_night("20-8") == NIGHT
+    assert parse_night("22:30 – 7") == Night(22 * 60 + 30, 7 * 60)
+    assert parse_night("1-6") == Night(60, 360)
+    assert parse_night("8-8") is None
+    assert parse_night("abc") is None
+    assert str(NIGHT) == "20:00–08:00"
+
+
+def test_skip_night_example_from_task():
+    # Последний пост 19:00, ночь 20–08, интервал 4ч -> 08:00 следующего дня
+    assert next_slot(at(19, 19), None, 4 * H, now=at(19, 12), night=NIGHT, tz=MSK) == at(20, 8)
+    # Интервал 14ч -> 09:00 (позже конца ночи)
+    assert next_slot(at(19, 19), None, 14 * H, now=at(19, 12), night=NIGHT, tz=MSK) == at(20, 9)
+
+
+def test_skip_night_edges():
+    assert skip_night(at(19, 19, 59), NIGHT, MSK) == at(19, 19, 59)
+    assert skip_night(at(19, 20), NIGHT, MSK) == at(20, 8)
+    assert skip_night(at(20, 3), NIGHT, MSK) == at(20, 8)  # после полуночи — в тот же день
+    assert skip_night(at(20, 8), NIGHT, MSK) == at(20, 8)
+    day_night = Night(13 * 60, 14 * 60)  # окно без перехода через полночь
+    assert skip_night(at(19, 13, 30), day_night, MSK) == at(19, 14)
+    assert skip_night(at(19, 12), None, MSK) == at(19, 12)
+
+
+def test_respace_with_night_and_first():
+    times = [at(19, 16), at(19, 18), at(19, 20), at(20, 8)]
+    assert respace(times, 2 * H, night=NIGHT, tz=MSK) == [
+        at(19, 16), at(19, 18), at(20, 8), at(20, 10)
+    ]
+    assert respace(times, 3 * H, night=NIGHT, tz=MSK, first=at(19, 10)) == [
+        at(19, 10), at(19, 13), at(19, 16), at(19, 19)
+    ]
+
+
+def test_parse_datetime():
+    now = at(19, 12)
+    assert parse_datetime("14:30", now, MSK) == at(19, 14, 30)
+    assert parse_datetime("09:00", now, MSK) == at(20, 9)  # уже прошло -> завтра
+    assert parse_datetime("21.11 14:30", now, MSK) == at(21, 14, 30)
+    assert parse_datetime("21.11.2026 14:30", now, MSK) == at(21, 14, 30)
+    assert parse_datetime("25:00", now, MSK) is None
+    assert parse_datetime("31.02 10:00", now, MSK) is None
+    assert parse_datetime("завтра", now, MSK) is None
+
+
+def test_service_first_and_night(tmp_path):
+    async def scenario():
+        db = Database(str(tmp_path / "n.db"))
+        await db.connect()
+        clock = [at(19, 9)]
+        sched = Scheduler(db, tz=MSK, clock=lambda: clock[0])
+        ch = -1002
+        await db.upsert_channel(ch, "Test", None, 120)
+        for i in range(4):
+            await sched.add_post(ch, 1, 1, [i], "p")
+        # 11, 13, 15, 17
+        posts = await sched.set_first_time(ch, at(19, 15))
+        assert [p["publish_at"] for p in posts] == [at(19, 15), at(19, 17), at(19, 19), at(19, 21)]
+        posts = await sched.set_night(ch, NIGHT)
+        assert [p["publish_at"] for p in posts] == [at(19, 15), at(19, 17), at(19, 19), at(20, 8)]
+        _, t = await sched.add_post(ch, 1, 1, [9], "p")
+        assert t == at(20, 10)
+        posts = await sched.set_night(ch, None)
+        assert posts[-2]["publish_at"] == at(19, 21)
+        await db.close()
+
+    asyncio.run(scenario())

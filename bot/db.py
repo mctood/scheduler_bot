@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS channels (
     username          TEXT,
     interval_minutes  INTEGER NOT NULL,
     last_published_at INTEGER,
-    active            INTEGER NOT NULL DEFAULT 1
+    active            INTEGER NOT NULL DEFAULT 1,
+    night_start       INTEGER,
+    night_end         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -56,7 +58,14 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        columns = {r["name"] for r in await self._fetchall("PRAGMA table_info(channels)")}
+        for name in ("night_start", "night_end"):
+            if name not in columns:
+                await self.conn.execute(f"ALTER TABLE channels ADD COLUMN {name} INTEGER")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -105,6 +114,12 @@ class Database:
     async def set_interval(self, chat_id: int, minutes: int) -> None:
         await self._write(
             "UPDATE channels SET interval_minutes = ? WHERE chat_id = ?", (minutes, chat_id)
+        )
+
+    async def set_night(self, chat_id: int, start: int | None, end: int | None) -> None:
+        await self._write(
+            "UPDATE channels SET night_start = ?, night_end = ? WHERE chat_id = ?",
+            (start, end, chat_id),
         )
 
     async def set_last_published(self, chat_id: int, ts: int) -> None:
